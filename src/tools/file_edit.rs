@@ -11,8 +11,9 @@
 use crate::tools::Tool;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
+use tokio::fs as async_fs;
 
 pub struct EditTool;
 
@@ -71,11 +72,16 @@ impl Tool for EditTool {
         }
 
         let path = Path::new(file_path);
-        if !path.exists() {
-            return Err(anyhow!("Edit: file not found: {}", file_path));
-        }
+        async_fs::metadata(path).await.map_err(|e| {
+            if e.kind() == ErrorKind::NotFound {
+                anyhow!("Edit: file not found: {}", file_path)
+            } else {
+                anyhow!("Edit: cannot stat '{}': {}", file_path, e)
+            }
+        })?;
 
-        let content = fs::read_to_string(path)
+        let content = async_fs::read_to_string(path)
+            .await
             .map_err(|e| anyhow!("Edit: cannot read '{}': {}", file_path, e))?;
 
         let matches = content.matches(old_string).count();
@@ -101,7 +107,8 @@ impl Tool for EditTool {
             content.replacen(old_string, new_string, 1)
         };
 
-        fs::write(path, &new_content)
+        async_fs::write(path, &new_content)
+            .await
             .map_err(|e| anyhow!("Edit: cannot write '{}': {}", file_path, e))?;
 
         Ok(format!(
@@ -116,6 +123,7 @@ impl Tool for EditTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

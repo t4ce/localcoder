@@ -6,8 +6,8 @@ use super::types::{
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
+use tokio::fs as async_fs;
 use tokio::sync::Mutex;
 
 pub struct LspServerManager {
@@ -95,7 +95,7 @@ impl LspServerManager {
         method: &str,
         params: Value,
     ) -> Result<Option<(String, Value)>> {
-        let absolute = self.resolve_path(file_path)?;
+        let absolute = self.resolve_path(file_path).await?;
         let extension = canonical_extension(&absolute)
             .ok_or_else(|| anyhow!("file has no extension: {}", absolute.display()))?;
         let Some(config) = self.config_for_extension(&extension).cloned() else {
@@ -161,14 +161,14 @@ impl LspServerManager {
         Ok(())
     }
 
-    fn resolve_path(&self, path: &Path) -> Result<PathBuf> {
+    async fn resolve_path(&self, path: &Path) -> Result<PathBuf> {
         let candidate = if path.is_absolute() {
             path.to_path_buf()
         } else {
             self.cwd.join(path)
         };
-        candidate
-            .canonicalize()
+        async_fs::canonicalize(&candidate)
+            .await
             .with_context(|| format!("failed to resolve path: {}", candidate.display()))
     }
 
@@ -231,7 +231,7 @@ impl LspServerManager {
 
     async fn sync_document(server: &mut RunningServer, path: &Path) -> Result<()> {
         let uri = file_uri(path)?;
-        let text = fs::read_to_string(path).with_context(|| {
+        let text = async_fs::read_to_string(path).await.with_context(|| {
             format!(
                 "failed to read source file for LSP sync: {}",
                 path.display()
@@ -369,6 +369,7 @@ fn initialization_params(cwd: &Path, root_uri: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::TempDir;
 
     #[test]

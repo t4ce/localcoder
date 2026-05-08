@@ -9,11 +9,12 @@
 
 use crate::tools::Tool;
 use anyhow::{Result, anyhow};
-use glob::glob;
+use glob::Pattern;
 use serde_json::{Value, json};
 use std::env;
-use std::fs;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
+use tokio::fs;
 
 /// Maximum number of results before truncation.
 const MAX_RESULTS: usize = 100;
@@ -55,10 +56,10 @@ impl Tool for GlobTool {
         let base_dir = match input["path"].as_str() {
             Some(p) if !p.is_empty() => {
                 let path = PathBuf::from(p);
-                if !path.exists() {
-                    return Err(anyhow!("Glob: directory does not exist: {}", p));
-                }
-                if !path.is_dir() {
+                let metadata = fs::metadata(&path)
+                    .await
+                    .map_err(|_| anyhow!("Glob: directory does not exist: {}", p))?;
+                if !metadata.is_dir() {
                     return Err(anyhow!("Glob: path is not a directory: {}", p));
                 }
                 path
@@ -67,31 +68,28 @@ impl Tool for GlobTool {
         };
 
         // Build full glob pattern: base_dir/pattern
-        let full_pattern = if pattern.starts_with('/') {
-            pattern.to_string()
+        let full_pattern = if Path::new(pattern).is_absolute() {
+            PathBuf::from(pattern)
         } else {
-            base_dir
-                .join(pattern)
-                .to_str()
-                .ok_or_else(|| anyhow!("Glob: invalid path encoding"))?
-                .to_string()
+            base_dir.join(pattern)
         };
+        let matcher = Pattern::new(
+            full_pattern
+                .to_str()
+                .ok_or_else(|| anyhow!("Glob: invalid path encoding"))?,
+        )
+        .map_err(|e| anyhow!("Glob: invalid glob pattern: {}", e))?;
+        let search_root = static_search_root(&full_pattern);
 
-        let entries: Vec<PathBuf> = glob(&full_pattern)?
-            .filter_map(|e| e.ok())
-            .filter(|p| p.is_file())
-            .collect();
+        let mut entries = collect_matching_files(search_root, &matcher).await?;
 
         if entries.is_empty() {
             return Ok("No files found".to_string());
         }
 
         // Sort by modification time (newest first)
-        let mut entries = entries;
         entries.sort_by(|a, b| {
-            let mtime_a = fs::metadata(a).and_then(|m| m.modified()).ok();
-            let mtime_b = fs::metadata(b).and_then(|m| m.modified()).ok();
-            mtime_b.cmp(&mtime_a) // newest first
+            b.modified.cmp(&a.modified) // newest first
         });
 
         let truncated = entries.len() > MAX_RESULTS;
@@ -101,13 +99,13 @@ impl Tool for GlobTool {
         let cwd = env::current_dir().unwrap_or_default();
         let filenames: Vec<String> = entries
             .iter()
-            .map(|p| {
-                if let Ok(rel) = p.strip_prefix(&cwd) {
+            .map(|entry| {
+                if let Ok(rel) = entry.path.strip_prefix(&cwd) {
                     rel.to_str()
-                        .unwrap_or(p.to_str().unwrap_or("?"))
+                        .unwrap_or(entry.path.to_str().unwrap_or("?"))
                         .to_string()
                 } else {
-                    p.to_str().unwrap_or("?").to_string()
+                    entry.path.to_str().unwrap_or("?").to_string()
                 }
             })
             .collect();
@@ -123,9 +121,96 @@ impl Tool for GlobTool {
     }
 }
 
+struct MatchedFile {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+}
+
+fn static_search_root(pattern: &Path) -> PathBuf {
+    let mut root = PathBuf::new();
+
+    for component in pattern.components() {
+        match component {
+            Component::Prefix(prefix) => root.push(prefix.as_os_str()),
+            Component::RootDir => root.push(component.as_os_str()),
+            Component::CurDir | Component::ParentDir => root.push(component.as_os_str()),
+            Component::Normal(part) => {
+                if has_glob_magic(part.to_string_lossy().as_ref()) {
+                    break;
+                }
+                root.push(part);
+            }
+        }
+    }
+
+    if root.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        root
+    }
+}
+
+fn has_glob_magic(component: &str) -> bool {
+    component
+        .bytes()
+        .any(|b| matches!(b, b'*' | b'?' | b'[' | b']'))
+}
+
+async fn collect_matching_files(root: PathBuf, pattern: &Pattern) -> Result<Vec<MatchedFile>> {
+    let mut out = Vec::new();
+    let Ok(root_metadata) = fs::metadata(&root).await else {
+        return Ok(out);
+    };
+
+    if root_metadata.is_file() {
+        if pattern.matches_path(&root) {
+            out.push(MatchedFile {
+                path: root,
+                modified: root_metadata.modified().ok(),
+            });
+        }
+        return Ok(out);
+    }
+
+    if !root_metadata.is_dir() {
+        return Ok(out);
+    }
+
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let Ok(mut entries) = fs::read_dir(&dir).await else {
+            continue;
+        };
+
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(_) => break,
+            };
+            let path = entry.path();
+            let Ok(metadata) = entry.metadata().await else {
+                continue;
+            };
+
+            if metadata.is_dir() {
+                stack.push(path);
+            } else if metadata.is_file() && pattern.matches_path(&path) {
+                out.push(MatchedFile {
+                    path,
+                    modified: metadata.modified().ok(),
+                });
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
     use tempfile::TempDir;
 

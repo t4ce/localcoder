@@ -33,3 +33,5 @@ target
 *.swo
 *~
 
+# Ignore build artifacts and distribution files
+dist/

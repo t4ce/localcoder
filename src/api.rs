@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 const DEFAULT_OLLAMA_MODEL: &str = "qwen3.5:4b";
+const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LLMSettings {
@@ -167,6 +168,7 @@ impl LLMClient {
     }
 
     fn from_settings(settings: LLMSettings) -> Self {
+        ensure_tls_provider();
         let provider = settings.llm.provider;
 
         match provider {
@@ -174,7 +176,7 @@ impl LLMClient {
                 client: Client::new(),
                 provider: Provider::OpenAI,
                 base_url: settings.llm.base_url.trim_end_matches('/').to_string(),
-                api_key: settings.llm.api_key.filter(|key| !key.trim().is_empty()),
+                api_key: resolve_openai_api_key(settings.llm.api_key),
                 model: settings.llm.model,
                 max_tokens: 4096,
             },
@@ -444,12 +446,11 @@ impl LLMClient {
             .map(|(index, message)| map_message_for_openai(index, message))
             .collect::<Vec<_>>();
 
-        let body = if tools.is_empty() {
+        let mut body = if tools.is_empty() {
             json!({
                 "model": self.model,
                 "messages": openai_messages,
-                "stream": true,
-                "max_tokens": self.max_tokens
+                "stream": true
             })
         } else {
             json!({
@@ -457,10 +458,10 @@ impl LLMClient {
                 "messages": openai_messages,
                 "stream": true,
                 "tools": tools,
-                "tool_choice": "auto",
-                "max_tokens": self.max_tokens
+                "tool_choice": "auto"
             })
         };
+        insert_openai_compatible_token_limit(&mut body, self.provider, self.max_tokens);
 
         let mut response = self
             .authorized_request(
@@ -553,7 +554,7 @@ impl LLMClient {
         prompt: &str,
         max_tokens: u32,
     ) -> Result<String> {
-        let body = json!({
+        let mut body = json!({
             "model": self.model,
             "messages": [
                 {
@@ -561,9 +562,9 @@ impl LLMClient {
                     "content": prompt
                 }
             ],
-            "stream": false,
-            "max_tokens": max_tokens
+            "stream": false
         });
+        insert_openai_compatible_token_limit(&mut body, self.provider, max_tokens);
 
         let response = self
             .authorized_request(
@@ -868,6 +869,27 @@ fn validate_non_empty(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn ensure_tls_provider() {
+    #[cfg(not(target_os = "trueos"))]
+    {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
+fn resolve_openai_api_key(configured: Option<String>) -> Option<String> {
+    normalize_optional_string(configured).or_else(|| {
+        env::var(OPENAI_API_KEY_ENV)
+            .ok()
+            .and_then(|value| normalize_optional_string(Some(value)))
+    })
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn next_sse_event(buffer: &mut String) -> Option<String> {
     let lf = buffer.find("\n\n").map(|idx| (idx, 2));
     let crlf = buffer.find("\r\n\r\n").map(|idx| (idx, 4));
@@ -1102,6 +1124,17 @@ fn normalize_lmstudio_base_url(base_url: &str) -> String {
     }
 
     normalized
+}
+
+fn insert_openai_compatible_token_limit(body: &mut Value, provider: Provider, max_tokens: u32) {
+    let key = match provider {
+        Provider::OpenAI => "max_completion_tokens",
+        Provider::LMStudio | Provider::Ollama => "max_tokens",
+    };
+
+    if let Some(object) = body.as_object_mut() {
+        object.insert(key.to_string(), json!(max_tokens));
+    }
 }
 
 fn build_agent_response(text: String, tool_uses: Vec<ToolUseCall>) -> AgentResponse {
@@ -1430,6 +1463,37 @@ mod tests {
     }
 
     #[test]
+    fn from_settings_uses_openai_api_key_env_when_config_omits_key() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old_key = env::var_os(OPENAI_API_KEY_ENV);
+        unsafe {
+            env::set_var(OPENAI_API_KEY_ENV, " sk-env-test ");
+        }
+
+        let client = LLMClient::from_settings(LLMSettings {
+            llm: LLMConfig {
+                provider: Provider::OpenAI,
+                base_url: "https://api.openai.com/v1/".to_string(),
+                api_key: None,
+                model: "gpt-5.4-mini".to_string(),
+            },
+        });
+
+        assert_eq!(client.api_key.as_deref(), Some("sk-env-test"));
+        match old_key {
+            Some(value) => unsafe {
+                env::set_var(OPENAI_API_KEY_ENV, value);
+            },
+            None => unsafe {
+                env::remove_var(OPENAI_API_KEY_ENV);
+            },
+        }
+    }
+
+    #[test]
     fn from_settings_normalizes_lmstudio_v1_base_url() {
         let client = LLMClient::from_settings(LLMSettings {
             llm: LLMConfig {
@@ -1445,6 +1509,19 @@ mod tests {
             client.chat_completions_url(),
             "http://localhost:1234/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn openai_compatible_token_limit_uses_provider_specific_parameter() {
+        let mut openai_body = json!({"model": "gpt-5.4-mini"});
+        insert_openai_compatible_token_limit(&mut openai_body, Provider::OpenAI, 2048);
+        assert_eq!(openai_body["max_completion_tokens"], 2048);
+        assert!(openai_body.get("max_tokens").is_none());
+
+        let mut lmstudio_body = json!({"model": "deepseek-r1"});
+        insert_openai_compatible_token_limit(&mut lmstudio_body, Provider::LMStudio, 1024);
+        assert_eq!(lmstudio_body["max_tokens"], 1024);
+        assert!(lmstudio_body.get("max_completion_tokens").is_none());
     }
 
     #[test]

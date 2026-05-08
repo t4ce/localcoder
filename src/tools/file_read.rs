@@ -10,8 +10,9 @@
 use crate::tools::Tool;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
+use tokio::fs;
 
 pub struct ReadTool;
 
@@ -53,15 +54,19 @@ impl Tool for ReadTool {
 
         let path = Path::new(file_path);
 
-        if !path.exists() {
-            return Err(anyhow!("Read: file not found: {}", file_path));
-        }
-
-        if !path.is_file() {
+        let metadata = fs::metadata(path).await.map_err(|e| {
+            if e.kind() == ErrorKind::NotFound {
+                anyhow!("Read: file not found: {}", file_path)
+            } else {
+                anyhow!("Read: cannot stat '{}': {}", file_path, e)
+            }
+        })?;
+        if !metadata.is_file() {
             return Err(anyhow!("Read: path is not a file: {}", file_path));
         }
 
         let content = fs::read_to_string(path)
+            .await
             .map_err(|e| anyhow!("Read: cannot read '{}': {}", file_path, e))?;
 
         let lines: Vec<&str> = content.lines().collect();

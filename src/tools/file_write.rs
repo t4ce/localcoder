@@ -10,8 +10,8 @@
 use crate::tools::Tool;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-use std::fs;
 use std::path::Path;
+use tokio::fs as async_fs;
 
 pub struct WriteTool;
 
@@ -55,8 +55,8 @@ impl Tool for WriteTool {
 
         // Create parent directories if needed
         if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent).map_err(|e| {
+            if !parent.as_os_str().is_empty() {
+                async_fs::create_dir_all(parent).await.map_err(|e| {
                     anyhow!(
                         "Write: cannot create directories for '{}': {}",
                         file_path,
@@ -66,9 +66,10 @@ impl Tool for WriteTool {
             }
         }
 
-        let existed = path.exists();
+        let existed = async_fs::metadata(path).await.is_ok();
 
-        fs::write(path, content)
+        async_fs::write(path, content)
+            .await
             .map_err(|e| anyhow!("Write: cannot write '{}': {}", file_path, e))?;
 
         if existed {
@@ -82,6 +83,7 @@ impl Tool for WriteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::TempDir;
 
     #[tokio::test]
